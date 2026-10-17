@@ -6,8 +6,9 @@
 // whole set "breathes" red. This sketch makes the LEDC peripheral generate it.
 //
 // The waveform is produced in hardware, so loop() has nothing to do. There is
-// deliberately no Wi-Fi and no OTA: the only way this ESP32 restarts is when
-// the whole thing loses power, and then the tiles restart with it.
+// deliberately no Wi-Fi and no OTA: nothing in the firmware can restart the
+// ESP32 and drop ID while the tiles are powered. GPIO -> yellow wire directly,
+// with the ESP32's GND tied to the 24 V supply's minus.
 //
 // Uses the ESP-IDF LEDC driver directly, so it builds unchanged on
 // arduino-esp32 core 2.x and 3.x (the ESP32-C6 needs core 3.x).
