@@ -1,4 +1,4 @@
-// LIFX Tile PSU replacement: ID signal generator for any ESP32 (basic build).
+// LIFX Tile PSU replacement: ID signal generator for any ESP32.
 //
 // The original Tile power supply puts a 0-3.3 V square wave on the yellow
 // "ID" wire (pin 7), derived from the mains frequency. The leader tile only
@@ -8,10 +8,6 @@
 // The waveform is produced in hardware, so loop() has nothing to do. There is
 // deliberately no Wi-Fi and no OTA: the only way this ESP32 restarts is when
 // the whole thing loses power, and then the tiles restart with it.
-//
-// This sketch is for the basic build, where the tiles' 24 V comes straight
-// from the brick. If you built the MOSFET switch, use the ESPHome config: it
-// has the start-up sequencing and crash guards that switching needs.
 //
 // Uses the ESP-IDF LEDC driver directly, so it builds unchanged on
 // arduino-esp32 core 2.x and 3.x (the ESP32-C6 needs core 3.x).

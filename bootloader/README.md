@@ -10,7 +10,7 @@ E (30) boot.esp32: XMC startup flow failed, reboot!
 The chip is fine. Its flash just isn't on Espressif's list.
 
 > [!NOTE]
-> It works on my board: an ESP32-D0WDQ6 with an XM25QH64A (`20 70 17`), flashed from the PlatformIO project in `arduino/`. Other people report normal operation with the same patch on the XM25QH128A (see [sources](#sources)). The ESPHome route below uses the same file, but I haven't run that one yet.
+> It works on my board: an ESP32-D0WDQ6 with an XM25QH64A (`20 70 17`), flashed from the PlatformIO project in `arduino/`. Other people report normal operation with the same patch on the XM25QH128A (see [sources](#sources)).
 
 ## What's going on
 
@@ -34,7 +34,7 @@ What fixes it: a bootloader with the A-series added to the list. Then the chip p
 
 ## Do I need it?
 
-Plug the board in over USB and ask the flash who it is. This needs esptool 5.x (`pip install esptool`, or the one that comes with ESPHome). Close any serial monitor on that port first.
+Plug the board in over USB and ask the flash who it is. This needs esptool 5.x (`pip install esptool`). Close any serial monitor on that port first.
 
 ```bash
 python -m esptool --port COM6 flash-id
@@ -71,32 +71,12 @@ python -m esptool --chip esp32 --port COM6 write-flash 0x1000 bootloader/bootloa
 
 Opening `arduino/` in PlatformIO instead does that for you.
 
-## ESPHome
-
-ESPHome builds its own bootloader from ESP-IDF, with the same check. Normal OTA updates never touch the bootloader, so you only patch it after USB flashes.
-
-#### 1: Flash ESPHome over USB as usual
-
-The board boot-loops afterwards. That's expected. Stop the log ESPHome opens afterwards, so the port is free.
-
-#### 2: Write this bootloader over the stock one
-
-```bash
-python -m esptool --chip esp32 --port COM6 write-flash 0x1000 bootloader/bootloader_xmc_a.bin
-```
-
-#### 3: Reset the board
-
-It should boot now, and every normal OTA update from here on leaves the bootloader alone. Only a USB re-flash puts the stock one back; repeat step 2 after one.
-
-Voila!
-
 ## Is it safe?
 
 - **The change:** 7 lines in ESP-IDF 5.5.5's `bootloader_flash.c`, adding `20 70 17` to `20 70 20` to the XMC list ([`build/bootloader_flash_xmc_a.patch`](build/bootloader_flash_xmc_a.patch)). Everything else is the stock bootloader, and only the bootloader changes; the app is untouched.
 - **On other boards:** it only adds IDs to the list, so any other flash takes exactly the same path as with the stock bootloader.
 - **What it skips on A-series chips:** XMC's startup sequence. It is written for the C-series (the bootloader even calls it "XM25QHxxC startup flow"), and the people who've run A-series chips with this patch report normal operation.
-- **Settings:** the same as Arduino's and ESPHome's bootloaders where it matters (DIO, 40 MHz, partition table at `0x8000`, app rollback on). It logs errors only, like Arduino's (ESPHome's also prints info lines), and it leaves "skip validation on deep-sleep wake" off, like ESPHome's.
+- **Settings:** the same as the stock bootloader PlatformIO flashes for this project (arduino-esp32 3.3.12's `bootloader_dio_40m`) where it matters (DIO, 40 MHz, partition table at `0x8000`, app rollback on, errors-only logging). The one difference: it leaves "skip validation on deep-sleep wake" off, and the sketch never sleeps. The Arduino IDE's "ESP32 Dev Module" defaults to a QIO, 80 MHz bootloader, so there the flash mode and speed differ too; I've only run it from PlatformIO.
 - **Checked:** I disassembled the built bootloader to confirm `20 70 17` is accepted, checked that the sketch's upload and factory image carry it at `0x1000`, and my board boots with it.
 - **Recovery:** nothing here can brick the board. The ESP32's download mode lives in ROM, so any esptool or PlatformIO upload over USB (hold BOOT if auto-reset doesn't kick in) puts things back. A normal Arduino IDE upload restores the stock bootloader.
 
