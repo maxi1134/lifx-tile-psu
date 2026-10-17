@@ -1,0 +1,447 @@
+# LIFX Tile PSU replacement (smart build)
+#
+# The ESP32 generates the Tile "ID" square wave on the yellow wire (pin 7) and
+# switches the tiles' +24 V through a high-side P-MOSFET. Tiles only get power
+# once ID is running. An orderly reboot (OTA, restart button) switches them off
+# first, while ID is still clean. After a crash the MOSFET pin stays latched
+# through the reset, so the tiles stay powered for about half a second with ID
+# briefly off-spec, until the new firmware switches them off.
+#
+# It also watches the 24 V supply through a divider (R12/R13) into an ADC pin.
+# Lose the 24 V and the tiles are switched off and ID stops; when it has been
+# back and steady, the normal guarded start runs. That matters most when the
+# ESP32 has its own 5 V supply and no longer restarts with the 24 V.
+#
+# Wiring and parts: see ../README.md. Running without the MOSFET? Use the
+# Arduino sketch instead (no Wi-Fi, no OTA, nothing that can reboot it).
+
+substitutions:
+  name: lifx-tile-psu
+  friendly_name: LIFX Tile PSU
+
+  # GPIO numbers for an ESP32 DevKitC / WROOM-32. ESP32-C3 SuperMini: 4 / 5 / 3 / 1.
+  # ESP32-S3: 4 / 5 / 6 / 7. Never a strapping pin.
+  id_gpio: "25"           # -> 100R -> BAT54S node -> 1k -> yellow wire
+  tile_power_gpio: "26"   # -> 4.7k -> 2N3904 base (P-MOSFET gate driver)
+  id_sense_gpio: "27"     # <- 47k <- yellow wire (reads the ID back)
+  supply_sense_gpio: "34" # <- R12 100k / R13 8.2k divider from +24 V (ADC1 pin)
+
+  # The tile accepts 45-65 Hz. The original PSU followed the mains frequency.
+  id_frequency: 50Hz
+
+  # Timing guards. Five short power cycles in a row factory-reset the tiles.
+  id_lead_time: 1s          # ID runs this long before 24 V is applied
+  tile_min_off_ms: "3000"   # tiles stay unpowered at least this long
+  tile_min_on_ms: "10000"   # tiles stay powered at least this long
+  crash_hold_ms: "60000"    # after a crash/brownout reset, wait this long first
+  start_ok_after_ms: "30000" # a start counts as good once tiles ran this long
+  max_failed_starts: "3"    # this many short-lived starts in a row: stop trying
+
+  # 24 V supervision. (100k + 8.2k) / 8.2k = 13.195, so 24 V reads as 1.82 V.
+  supply_divider: "13.195"
+  supply_on_v: "20.0"      # 24 V counts as present above this...
+  supply_off_v: "16.0"     # ...and as lost below this
+  supply_settle: 2s         # present this long before a start is allowed
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.9.0
+  on_boot:
+    priority: 600
+    then:
+      - lambda: |-
+          // Starts that died before start_ok_after (crash, brownout, inrush
+          // taking the brick down, someone yanking the plug) are counted in
+          // flash. Too many in a row and the tiles stay off until you say so.
+          // in_flash = true: NVS survives a full power loss, RTC memory doesn't.
+          id(failed_starts_pref) =
+              global_preferences->make_preference<uint8_t>(0x7A11E5F1UL, true);
+          uint8_t fails = 0;
+          if (id(failed_starts_pref).load(&fails))
+            id(tiles_failed_starts) = fails;
+          if (fails >= ${max_failed_starts}) {
+            id(tiles_blocked) = true;
+            ESP_LOGE("tiles", "%u failed starts in a row, auto-start blocked",
+                     (unsigned) fails);
+          }
+
+          // After an abnormal reset, wait before powering up anyway.
+          switch (esp_reset_reason()) {
+            case ESP_RST_PANIC:
+            case ESP_RST_INT_WDT:
+            case ESP_RST_TASK_WDT:
+            case ESP_RST_WDT:
+            case ESP_RST_BROWNOUT:
+              id(tiles_hold_until_ms) = ${crash_hold_ms};
+              ESP_LOGW("tiles", "Abnormal reset, holding tile power for %u s",
+                       (unsigned) (${crash_hold_ms} / 1000));
+              break;
+            default:
+              break;
+          }
+      - script.execute: tiles_apply
+  on_shutdown:
+    then:
+      - lambda: |-
+          // Orderly reboot: drop tile power now, while ID is still clean,
+          // and give the rail time to collapse before the restart.
+          if (id(tile_power).state) {
+            id(tile_power).turn_off();
+            if (id(tiles_failed_starts) != 0) {
+              id(tiles_failed_starts) = 0;
+              uint8_t zero = 0;
+              id(failed_starts_pref).save(&zero);
+              global_preferences->sync();
+            }
+            delay(250);
+          }
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  # Never reboot because Home Assistant is away: a reboot power-cycles the tiles.
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  reboot_timeout: 0s
+
+# Save "Tiles power" within seconds, so a power cut right after a change
+# doesn't bring back the old state. Only changed keys are written.
+preferences:
+  flash_write_interval: 5s
+
+# In safe mode none of the components below run: no ID, no tile control.
+# RTC storage only counts crash/reboot loops, not someone unplugging the brick.
+safe_mode:
+  storage: rtc
+  num_attempts: 3
+  on_safe_mode:
+    - lambda: |-
+        // After a crash the MOSFET pin can still be high from before the
+        // reset, which would leave the tiles powered with no ID. Drop it.
+        gpio_set_level((gpio_num_t) ${tile_power_gpio}, 0);
+        gpio_set_direction((gpio_num_t) ${tile_power_gpio}, GPIO_MODE_OUTPUT);
+
+globals:
+  # What the user asked for (survives reboots and power cuts).
+  - id: tiles_wanted
+    type: bool
+    restore_value: true
+    initial_value: "true"
+  # millis() of the last tile power change. 0 = boot, which counts as "off".
+  - id: tiles_changed_ms
+    type: uint32_t
+    initial_value: "0"
+  # Extra wait after an abnormal reset (set in on_boot).
+  - id: tiles_hold_until_ms
+    type: uint32_t
+    initial_value: "0"
+  # Consecutive starts that never reached start_ok_after. Mirrors the flash
+  # copy, which is written straight away (not on the 1 s globals cycle).
+  - id: tiles_failed_starts
+    type: uint8_t
+    initial_value: "0"
+  - id: failed_starts_pref
+    type: ESPPreferenceObject
+  - id: tiles_blocked
+    type: bool
+    initial_value: "false"
+
+output:
+  - platform: ledc
+    id: tile_id
+    pin: GPIO${id_gpio}
+    frequency: ${id_frequency}
+    # Channels 0 and 1 share LEDC timer 0. Give any other ledc output channel 2+.
+    channel: 0
+    # Do not set inverted / min_power / max_power here: 50 % must stay 50 %.
+
+switch:
+  # Raw MOSFET driver. Off at setup, so a restart always drops tile power.
+  - platform: gpio
+    id: tile_power
+    pin: GPIO${tile_power_gpio}
+    restore_mode: ALWAYS_OFF
+    internal: true
+
+  # What Home Assistant sees. Changes go through tiles_apply and its guards.
+  - platform: template
+    id: tiles_switch
+    name: Tiles power
+    icon: mdi:view-grid
+    # The default (ALWAYS_OFF) would run turn_off_action at boot and wipe
+    # tiles_wanted. The restored global already remembers the state.
+    restore_mode: DISABLED
+    # Shows off while auto-start is blocked, so turning it on means "try again".
+    lambda: return id(tiles_wanted) && !id(tiles_blocked);
+    turn_on_action:
+      - lambda: |-
+          id(tiles_wanted) = true;
+          if (id(tiles_blocked)) {
+            // One more try. If it fails too, it blocks again straight away.
+            id(tiles_blocked) = false;
+            id(tiles_failed_starts) = ${max_failed_starts} - 1;
+          }
+      - script.execute: save_failed_starts
+      - script.execute: tiles_apply
+    turn_off_action:
+      - globals.set:
+          id: tiles_wanted
+          value: "false"
+      - script.execute: tiles_apply
+
+script:
+  # Moves the hardware towards tiles_wanted, honouring the timing guards.
+  # Restart-safe: every step re-checks the current state.
+  - id: tiles_apply
+    mode: restart
+    then:
+      # Tiles unpowered and not about to start (switched off, or no 24 V):
+      # stop ID, so no ID goes into unpowered tiles.
+      - if:
+          condition:
+            lambda: |-
+              return !id(tile_power).state &&
+                     !(id(tiles_wanted) && id(tile_supply).state);
+          then:
+            - delay: 500ms
+            - output.set_level:
+                id: tile_id
+                level: 0%
+      - if:
+          condition:
+            lambda: return id(tiles_wanted) && !id(tile_power).state;
+          then:
+            - wait_until:
+                condition:
+                  lambda: |-
+                    uint32_t now = millis();
+                    return !id(tiles_wanted) ||
+                           (!id(tiles_blocked) && id(tile_supply).state &&
+                            now >= id(tiles_hold_until_ms) &&
+                            now - id(tiles_changed_ms) >= ${tile_min_off_ms});
+            - if:
+                condition:
+                  lambda: return id(tiles_wanted);
+                then:
+                  - output.set_level:
+                      id: tile_id
+                      level: 50%
+                  - delay: ${id_lead_time}
+                  # On the classic ESP32 a duty write that lands within one PWM
+                  # period of the previous one is skipped. Nothing is pending
+                  # now, so this one sticks even if the first was dropped.
+                  - output.set_level:
+                      id: tile_id
+                      level: 50%
+                  - delay: 100ms
+                  - if:
+                      condition:
+                        lambda: return id(tiles_wanted) && id(tile_supply).state;
+                      then:
+                        # Count the start before power goes on, so a start that
+                        # kills the ESP32 is still on record at the next boot.
+                        - lambda: |-
+                            if (id(tiles_failed_starts) < 255)
+                              id(tiles_failed_starts)++;
+                        - script.execute: save_failed_starts
+                        - lambda: id(tiles_changed_ms) = millis();
+                        - switch.turn_on: tile_power
+                        - logger.log: Tiles powered
+      - if:
+          condition:
+            lambda: return !id(tiles_wanted) && id(tile_power).state;
+          then:
+            - wait_until:
+                condition:
+                  lambda: |-
+                    return id(tiles_wanted) ||
+                           millis() - id(tiles_changed_ms) >= ${tile_min_on_ms};
+            - if:
+                condition:
+                  lambda: return !id(tiles_wanted);
+                then:
+                  - switch.turn_off: tile_power
+                  - lambda: |-
+                      id(tiles_changed_ms) = millis();
+                      // Switched off on purpose: not a failed start.
+                      id(tiles_failed_starts) = 0;
+                  - script.execute: save_failed_starts
+                  - logger.log: Tiles unpowered
+                  # Keep ID running while the tile rail collapses, then stop it.
+                  - delay: 500ms
+                  - output.set_level:
+                      id: tile_id
+                      level: 0%
+
+  # Writes the failed-start counter to flash right away.
+  - id: save_failed_starts
+    then:
+      - lambda: |-
+          uint8_t v = id(tiles_failed_starts);
+          id(failed_starts_pref).save(&v);
+          global_preferences->sync();
+
+button:
+  # The "unplug it and plug it back in" fix, without walking to the wall.
+  # Also clears a blocked auto-start (via the switch's turn_on_action).
+  - platform: template
+    name: Power-cycle tiles
+    icon: mdi:restart
+    on_press:
+      - switch.turn_off: tiles_switch
+      - wait_until:
+          condition:
+            switch.is_off: tile_power
+          timeout: 30s
+      - switch.turn_on: tiles_switch
+
+interval:
+  - interval: 5s
+    then:
+      # Belt and braces: re-apply 50 % while powered. Writing the same level
+      # again is a no-op, so this only acts if a write was ever dropped.
+      - if:
+          condition:
+            switch.is_on: tile_power
+          then:
+            - output.set_level:
+                id: tile_id
+                level: 50%
+      # The tiles have run long enough: this start was a good one.
+      - if:
+          condition:
+            lambda: |-
+              return id(tile_power).state && id(tiles_failed_starts) != 0 &&
+                     millis() - id(tiles_changed_ms) >= ${start_ok_after_ms};
+          then:
+            - lambda: id(tiles_failed_starts) = 0;
+            - script.execute: save_failed_starts
+
+sensor:
+  # Reads the ID back off the yellow wire, so you can check it without a scope.
+  - platform: pulse_meter
+    id: id_frequency_sensor
+    name: Tile ID frequency
+    pin:
+      number: GPIO${id_sense_gpio}
+      mode:
+        input: true
+    internal_filter: 5ms
+    timeout: 500ms
+    unit_of_measurement: Hz
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.0166667 # pulses/min -> Hz
+      - throttle_average: 5s
+      # pulse_meter reports 0 only once when the signal stops, which usually
+      # gets averaged away. Turn silence into a real 0 Hz.
+      - timeout:
+          timeout: 7s
+          value: 0
+
+  # The 24 V supply, through R12/R13, checked every 10 ms. A dropout still
+  # there at the next check switches the tiles off; a shorter one (a loose
+  # contact) can slip between two checks. Internal and unfiltered, so the
+  # supervision below sees every reading.
+  - platform: adc
+    id: supply_voltage_raw
+    internal: true
+    pin: GPIO${supply_sense_gpio}
+    attenuation: 12db
+    samples: 4
+    update_interval: 10ms
+    filters:
+      - multiply: ${supply_divider}
+      # A healthy 23.5-25.5 V supply reads well under 29.5 V. A pin pegged high
+      # (R13 or its ground open) reads 30-42 V whatever the 24 V does, which
+      # would hide a lost supply: treat that as no supply, so the tiles stay off.
+      # Must be 0, not NAN: analog_threshold ignores NAN and keeps its state.
+      - lambda: "return x > 29.5f ? 0.0f : x;"
+
+  # The same reading for Home Assistant, only on changes of 0.5 V or more.
+  - platform: copy
+    source_id: supply_voltage_raw
+    id: supply_voltage
+    name: Tile supply voltage
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+    filters:
+      - delta: 0.5
+
+binary_sensor:
+  # 24 V present, with hysteresis. Only counts as back once it has been
+  # steady for supply_settle.
+  - platform: analog_threshold
+    id: tile_supply
+    name: Tile supply
+    device_class: power
+    sensor_id: supply_voltage_raw
+    threshold:
+      upper: ${supply_on_v}
+      lower: ${supply_off_v}
+    filters:
+      - delayed_on: ${supply_settle}
+    on_press:
+      - logger.log: 24 V present
+      - script.execute: tiles_apply
+    on_release:
+      - if:
+          condition:
+            switch.is_on: tile_power
+          then:
+            - switch.turn_off: tile_power
+            - lambda: |-
+                uint32_t ran = millis() - id(tiles_changed_ms);
+                id(tiles_changed_ms) = millis();
+                if (ran >= ${start_ok_after_ms}) {
+                  // Ran fine for a while: a supply outage, not a failed start.
+                  id(tiles_failed_starts) = 0;
+                } else if (id(tiles_failed_starts) >= ${max_failed_starts}) {
+                  // The 24 V keeps dying right after a start (a brick tripping
+                  // on inrush, a bad contact): stop trying.
+                  id(tiles_blocked) = true;
+                  ESP_LOGE("tiles", "24 V lost right after %u starts in a row, auto-start blocked",
+                           (unsigned) id(tiles_failed_starts));
+                }
+                ESP_LOGW("tiles", "24 V lost after %u ms, tiles switched off", (unsigned) ran);
+            - script.execute: save_failed_starts
+      - script.execute: tiles_apply
+
+  # The MOSFET is on and the 24 V is there.
+  - platform: template
+    name: Tiles powered
+    device_class: power
+    lambda: return id(tile_power).state && id(tile_supply).state;
+
+  # On while the tiles are powered but the ID read back is outside 45-65 Hz.
+  - platform: template
+    name: Tile ID fault
+    device_class: problem
+    entity_category: diagnostic
+    lambda: |-
+      if (!id(tile_power).state) return false;
+      float f = id(id_frequency_sensor).state;
+      return std::isnan(f) || f < 45.0f || f > 65.0f;
+    filters:
+      - delayed_on: 15s
+
+  # On after max_failed_starts short-lived starts in a row. Turn "Tiles power"
+  # on (or press "Power-cycle tiles") to try again.
+  - platform: template
+    name: Tile auto-start blocked
+    device_class: problem
+    lambda: return id(tiles_blocked);

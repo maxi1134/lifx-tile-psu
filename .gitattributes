@@ -1,0 +1,4 @@
+# Byte-exact: flashed as-is at 0x1000
+*.bin binary
+# Patches must keep LF to apply cleanly
+*.patch text eol=lf

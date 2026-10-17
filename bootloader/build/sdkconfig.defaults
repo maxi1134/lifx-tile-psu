@@ -1,0 +1,15 @@
+# Keep the XMC handling on: the patched whitelist now covers the A-series.
+CONFIG_BOOTLOADER_FLASH_XMC_SUPPORT=y
+# Match the arduino-esp32 3.3.x and ESPHome bootloaders where it matters.
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# Errors only, like Arduino's bootloader. Info-level logging prints ~1.5 KB at
+# 115200 baud (~0.13 s) before the app starts, and the tiles want ID early.
+# The XMC error lines are error level, so they still print.
+CONFIG_BOOTLOADER_LOG_LEVEL_ERROR=y
+# Left off to match ESPHome's bootloader. The sketch never deep-sleeps, so
+# skipping validation on wake buys nothing.
+# CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP is not set

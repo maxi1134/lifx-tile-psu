@@ -1,0 +1,16 @@
+--- a/components/bootloader_support/bootloader_flash/src/bootloader_flash.c
++++ b/components/bootloader_support/bootloader_flash/src/bootloader_flash.c
+@@ -939,6 +939,13 @@
+         if (cpid >= 0x15 && cpid <= 0x16) {
+             matched =  true;
+         }
++    } else if (mfid == 0x70) {
++        // XMC A-series (XM25QH64A = 20 70 17, XM25QH128A = 20 70 18). Not on
++        // Espressif's list, so the stock bootloader runs the C-series startup
++        // flow on them and then refuses to boot. Accept them as XMC.
++        if (cpid >= 0x17 && cpid <= 0x20) {
++            matched = true;
++        }
+     }
+     return matched;
+ }
